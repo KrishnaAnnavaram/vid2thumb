@@ -520,8 +520,7 @@ All numbers come from the two **synthetic** sample folders. They do not measure 
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests | **41 passed**, 2 skipped (`ffmpeg` and faster-whisper absent) | `pytest -q` |
-| Expected CI (fresh venv, `pip install -e ".[dev]"`) | **41 passed**, 2 skipped. On a runner with `ffmpeg`, the `ffmpeg` test also runs | `.github/workflows/ci.yml` |
+| Unit tests (CI installs only `.[dev]`) | **41 passed**, 2 skipped (`ffmpeg` and faster-whisper absent). If `ffmpeg` is on PATH, the `ffmpeg` test also runs | `pytest -q` |
 | Transcript WER (synthetic captions with 8 % errors) | 0.058 (bread), 0.060 (bicycle), mean 0.059 | `vid2thumb demo` |
 | Extractive summary against the reference | ROUGE-1 0.429 / 0.530, ROUGE-L 0.286 / 0.482, mean ROUGE-1 0.479 | `vid2thumb demo` |
 | Summary support | 1.000 for both samples | `vid2thumb demo` |
@@ -542,7 +541,7 @@ Read these problems before you use vid2thumb in production.
 
 | # | Area | Problem | Impact and action |
 |---|---|---|---|
-| 1 | Evaluation | CI uses only synthetic samples. Results on real videos are not reproduced | Build the evaluation set (M6) before you compare models |
+| 1 | Evaluation | The tests and the demo use only synthetic samples. No result on real videos is in this README | Build the evaluation set (M6) before you compare models |
 | 2 | Placeholder | The placeholder image does not show the prompt | Use `VID2THUMB_GENERATOR=openai` or add a local model for a real image |
 | 3 | Support metric | Support checks words, not meaning. A summary can use true words in a false statement | Read the summary, or add an LLM judge (M7) |
 | 4 | Scenes | Histogram scene detection misses cuts between scenes with similar colours and can split a scene at a flash | Change the threshold of `scene_boundaries` for your videos |
