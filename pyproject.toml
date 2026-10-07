@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vid2thumb"
+version = "0.1.0"
+description = "Video to transcript to summary to AI-generated thumbnail"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Krishna Annavaram" }]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+asr = ["faster-whisper>=1.0"]
+summarize = ["transformers>=4.40", "torch>=2.1", "sentencepiece>=0.2"]
+clip = ["transformers>=4.40", "torch>=2.1"]
+openai = ["openai>=1.40"]
+download = ["yt-dlp>=2024.8.6"]
+all = ["vid2thumb[asr,summarize,clip,openai,download]"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+vid2thumb = "vid2thumb.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
