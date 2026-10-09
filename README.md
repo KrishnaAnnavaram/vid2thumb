@@ -75,6 +75,7 @@ This README is the **one location that explains all of vid2thumb**. It gives the
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one run](#42-the-life-cycle-of-one-run)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 📥 [Sources and ingest](#5-sources-and-ingest)
 6. 🎙️ [Audio and transcription](#6-audio-and-transcription)
 7. 🔵 [Summarizers](#7-summarizers)
@@ -150,6 +151,51 @@ flowchart LR
 | Pipeline | `src/vid2thumb/pipeline.py` | One run, all outputs in the run folder |
 | CLI | `src/vid2thumb/cli.py` | The `vid2thumb` command with 7 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    CLI["cli.py<br/>vid2thumb command"]
+    PIPE["pipeline.py<br/>run"]
+    subgraph INPUT["Input"]
+        CFG["config.py<br/>Settings.from_env, load_dotenv"]
+        ING["ingest.py<br/>resolve, download_url"]
+        SYN["synthetic.py<br/>make_sample"]
+    end
+    subgraph TEXT["Text branch"]
+        ASR["asr.py<br/>SidecarTranscriber, WhisperTranscriber"]
+        TRN["transcript.py<br/>Transcript, SRT and WebVTT"]
+        SUM["summarize.py<br/>build_summarizer"]
+        PRM["prompts.py<br/>build_visual_prompt"]
+        GEN["generate.py<br/>build_generator, cover"]
+        LLM["llm.py<br/>OpenAIChat, with_retries"]
+    end
+    subgraph FRAMES["Frame branch"]
+        MED["media.py<br/>ffmpeg, WAV, trim_silence"]
+        FRM["frames.py<br/>select_keyframes, rank_frames"]
+    end
+    EVA["evaluate.py<br/>WER, ROUGE, support, prompt checks"]
+
+    CLI --> CFG
+    CLI --> ING
+    CLI --> SYN
+    CLI --> PIPE
+    PIPE --> ASR
+    PIPE --> SUM
+    PIPE --> PRM
+    PIPE --> GEN
+    PIPE --> FRM
+    PIPE --> MED
+    PIPE --> EVA
+    ASR --> MED
+    ASR --> TRN
+    SUM --> LLM
+    PRM --> LLM
+    GEN --> LLM
+    FRM --> MED
+    SYN --> MED
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -189,11 +235,25 @@ vid2thumb/
 ### 3.1 Secrets come only from the environment
 `Settings.from_env` reads `OPENAI_API_KEY` from the environment or a local `.env` file. The key field has `repr=False`, and `run.json` records only `openai_api_key_set`. A test checks that no key pattern is in the source code and no key is in the run folder.
 
+```mermaid
+flowchart LR
+    ENV[/"Environment variable<br/>OPENAI_API_KEY"/] --> SET["Settings.from_env<br/>openai_api_key, repr=False"]
+    DOT[/"Local .env file<br/>git ignores it"/] --> LD["load_dotenv<br/>existing variables win"]
+    LD --> SET
+    SET --> NEED{"llm summarizer or<br/>openai generator?"}
+    NEED -- "no" --> OFF["Offline components<br/>no key used"]
+    NEED -- "yes" --> CLI["openai_client<br/>key set?"]
+    CLI -- "no" --> ERR[/"ProviderError<br/>OPENAI_API_KEY is not set"/]
+    CLI -- "yes" --> SDK["openai.OpenAI"]
+    SET --> PUB["Settings.public<br/>openai_api_key_set only"]
+    PUB --> RUN[("run.json")]
+```
+
 ### 3.2 No transcript is cut
 `Summarizer.summarize` splits a long transcript into sentence chunks inside the input budget, summarizes each chunk and summarizes the joined parts again. A test checks that the first and the last sentence of a long transcript reach the model.
 
 ### 3.3 All summarizers get the same task
-Each summarizer gets `SUMMARY_INSTRUCTION` and the same word budget (`VID2THUMB_SUMMARY_WORDS`). The LLM uses temperature 0. A reply that stops at `max_tokens` is an error, not a summary.
+Each summarizer gets the same word budget (`VID2THUMB_SUMMARY_WORDS`). The `llm` summarizer also gets `SUMMARY_INSTRUCTION`. The extractive and `bart` summarizers take no instruction text. The LLM uses temperature 0. A reply that stops at `max_tokens` is an error, not a summary.
 
 ### 3.4 The image prompt is a scene, inside its limit
 The summary is never sent to the generator without change. `build_visual_prompt` writes a short scene, adds a fixed style text and cuts the result at a word boundary inside the prompt limit of the generator.
@@ -214,10 +274,11 @@ Seeds, temperature 0 and deterministic offline components make the run repeatabl
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
+flowchart TD
     SRC{"Source"} -- "video file" --> FF["ffmpeg: 16 kHz audio, 1 fps frames"]
-    SRC -- "sample folder" --> SF["audio.wav, frames/, transcript.srt"]
-    SRC -- "--url" --> DL["licence and length check, yt-dlp"] --> FF
+    SRC -- "sample folder" --> SF[/"audio.wav, frames/, transcript.srt"/]
+    SRC -- "--url" --> OWN{{"HUMAN<br/>free licence or --i-own-this"}}
+    OWN --> DL["licence and length check, yt-dlp"] --> FF
     FF --> TR{"VID2THUMB_TRANSCRIBER"}
     SF --> TR
     TR -- "sidecar" --> SC["read .srt, .vtt, .json or .txt"]
@@ -227,18 +288,53 @@ flowchart TB
     T --> SUM["Summarizer: chunks, map, reduce"]
     SUM --> PR["Visual prompt inside the limit"]
     PR --> GEN["Generator: placeholder or OpenAI"]
-    GEN --> TG["thumbnail_generated.png"]
+    GEN --> TG[/"thumbnail_generated.png"/]
     FF --> FR["Frames"]
     SF --> FR
     FR --> SCN["Scene detection"] --> KEY["One keyframe for each scene"]
     KEY --> RANK["Rank: quality, or quality + CLIP relevance"]
     SUM --> RANK
-    RANK --> TF["thumbnail_frame.png"]
-    TG --> EV["metrics.json"]
+    RANK --> TF[/"thumbnail_frame.png"/]
+    TG --> EV["metrics.json, run.json"]
     TF --> EV
+    EV --> STORE[("outputs/run_id/")]
+    STORE --> CMP{{"HUMAN<br/>compare the two thumbnails"}}
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class OWN,CMP human
 ```
 
 ### 4.2 The life cycle of one run
+
+```mermaid
+stateDiagram-v2
+    state "Input path or URL" as Input
+    state "Source" as Src
+    state "Transcript" as Tr
+    state "Summary" as Sum
+    state "Visual prompt" as Prompt
+    state "Generated thumbnail" as Gen
+    state "Ranked keyframes" as Ranked
+    state "Metrics" as Met
+    state "Run folder complete" as Done
+    [*] --> Input
+    Input --> IngestError: bad path, licence or length
+    Input --> Src: resolve or download_url
+    Src --> TranscriptionError: no sidecar file
+    Src --> Tr: transcribe
+    Tr --> Sum: summarize with the word budget
+    Sum --> Prompt: build_visual_prompt
+    Prompt --> Gen: generate, then cover
+    Gen --> Ranked: select_keyframes, rank_frames
+    Tr --> ProviderError: chat call fails 3 times
+    Prompt --> ProviderError: image call fails 3 times
+    Ranked --> Met: prompt_checks, summary_metrics, WER
+    Met --> Done: run.json and metrics.json
+    Done --> [*]
+    IngestError --> [*]
+    TranscriptionError --> [*]
+    ProviderError --> [*]
+```
 
 1. `resolve` or `download_url` gives a `Source`.
 2. The transcriber gives a `Transcript` with timed segments.
@@ -249,11 +345,74 @@ flowchart TB
 7. `cover` crops the best frame to 1280 × 720.
 8. The pipeline calculates the metrics and writes all files to the run folder.
 
+### 4.3 Who does which step
+
+The sequence shows `vid2thumb run --input talk.mp4` with `whisper`, `llm`, `openai` and `clip`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Creator
+    participant CLI as vid2thumb CLI
+    participant PIPE as pipeline.py
+    participant FF as ffmpeg
+    participant ASR as WhisperTranscriber
+    participant SUM as LLMSummarizer
+    participant OAI as OpenAI API
+    participant FR as frames.py and CLIP
+    participant FS as outputs/run_id/
+
+    C->>CLI: vid2thumb run --input talk.mp4
+    CLI->>CLI: load_dotenv, Settings.from_env, build_components
+    CLI->>PIPE: run(source, settings, parts)
+    PIPE->>ASR: transcribe(source)
+    ASR->>FF: extract_audio, 16 kHz mono
+    ASR->>ASR: trim_silence, faster-whisper, TimeMap.to_original
+    ASR-->>PIPE: Transcript
+    PIPE->>FS: transcript.json, transcript.srt
+    PIPE->>SUM: summarize(text, summary_words)
+    loop each chunk, then the joined parts
+        SUM->>OAI: chat.completions.create, temperature 0
+        OAI-->>SUM: partial summary
+    end
+    PIPE->>FS: summary.txt
+    PIPE->>OAI: chat call for the visual prompt
+    PIPE->>FS: prompt.txt
+    PIPE->>OAI: images.generate, b64_json
+    OAI-->>PIPE: image and revised_prompt
+    PIPE->>FS: thumbnail_generated.png
+    PIPE->>FF: extract_frames, 1 fps
+    PIPE->>FR: select_keyframes, rank_frames with CLIPScore
+    FR-->>PIPE: ranked keyframes
+    PIPE->>FS: keyframes/, thumbnail_frame.png
+    PIPE->>FR: CLIPScore of both thumbnails
+    PIPE->>FS: metrics.json, run.json
+    CLI-->>C: run folder, summary, prompt and metrics
+```
+
 ---
 
 ## 5. Sources and ingest
 
 **Purpose.** Accept only inputs that the pipeline can read and that the user has the right to use.
+
+```mermaid
+flowchart TD
+    IN[/"--input path or --url"/] --> KIND{"Kind"}
+    KIND -- "folder" --> HAS{"audio.wav or frames/?"}
+    HAS -- "no" --> ERR[/"IngestError"/]
+    HAS -- "yes" --> SMP[/"Source: sample"/]
+    KIND -- "file" --> SUF{"Video suffix?"}
+    SUF -- "no" --> ERR
+    SUF -- "yes" --> VID[/"Source: video"/]
+    KIND -- "--url" --> INFO["yt-dlp: read the information<br/>no download"]
+    INFO --> LIC{"Licence in the allow list<br/>or --i-own-this?"}
+    LIC -- "no" --> ERR
+    LIC -- "yes" --> LEN{"Longer than<br/>VID2THUMB_MAX_MINUTES?"}
+    LEN -- "yes" --> ERR
+    LEN -- "no" --> DL["Download to outputs/downloads/"]
+    DL --> VID
+```
 
 | Input | Rule |
 |---|---|
@@ -275,6 +434,26 @@ flowchart TB
 
 **Purpose.** Get a timed transcript of the speech.
 
+```mermaid
+flowchart TD
+    SRC[/"Source"/] --> T{"VID2THUMB_TRANSCRIBER"}
+    T -- "sidecar" --> SC{"Sidecar file found?<br/>.srt, .vtt, .json, .txt"}
+    SC -- "no" --> ERR[/"TranscriptionError"/]
+    SC -- "yes" --> LOAD["load_transcript"]
+    T -- "whisper" --> WAV{"Sample audio.wav?"}
+    WAV -- "yes" --> READ["read_wav"]
+    WAV -- "no" --> EXT["extract_audio with ffmpeg<br/>16 kHz mono"]
+    EXT --> READ
+    READ --> REG["speech_regions<br/>30 ms, -40 dB, 1 s, 150 ms pad"]
+    REG --> EMPTY{"Any sound?"}
+    EMPTY -- "no" --> NONE[/"Empty transcript"/]
+    EMPTY -- "yes" --> TRIM["trim_silence<br/>trimmed audio and TimeMap"]
+    TRIM --> FW["faster-whisper<br/>temperature 0, beam size 5"]
+    FW --> MAP["TimeMap.to_original<br/>for each segment"]
+    MAP --> OUT[/"Transcript with timed segments"/]
+    LOAD --> OUT
+```
+
 | Transcriber | Input | Notes |
 |---|---|---|
 | `sidecar` | `<video>.srt`, `.vtt`, `.json` or `.txt`, or `transcript.*` in a sample folder | Offline. A missing file stops the run with a clear error |
@@ -293,6 +472,20 @@ flowchart TB
 ## 7. Summarizers
 
 **Purpose.** Make a short summary of the FULL transcript with the same task for each model.
+
+```mermaid
+flowchart TD
+    IN[/"Transcript text, word budget"/] --> FIT{"Fits the input budget,<br/>or level 4 reached?"}
+    FIT -- "yes" --> ONCE["_summarize_once"]
+    ONCE --> CUT["_limit_words<br/>cut at a sentence end"]
+    CUT --> OUT[/"Summary"/]
+    FIT -- "no" --> CH["chunk_sentences<br/>inside the budget, 1 sentence overlap"]
+    CH --> PER["Budget for each chunk<br/>2 x words / chunks + 10, at least 20"]
+    PER --> MAP["_summarize_once for each chunk"]
+    MAP --> JOIN["Join the partial summaries"]
+    JOIN --> NEXT["Next level"]
+    NEXT --> FIT
+```
 
 | Summarizer | Input budget | Notes |
 |---|---|---|
@@ -319,6 +512,23 @@ flowchart TB
 
 **Purpose.** Change a summary into a short scene for the image generator.
 
+```mermaid
+flowchart TD
+    IN[/"Summary"/] --> EMP{"Empty?"}
+    EMP -- "yes" --> ERR[/"ValueError"/]
+    EMP -- "no" --> LIM["limit_for the generator model<br/>budget = limit minus style text"]
+    LIM --> LLMQ{"LLM configured?<br/>VID2THUMB_SUMMARIZER=llm"}
+    LLMQ -- "yes" --> ASK["LLM writes one scene<br/>subject, setting, mood"]
+    LLMQ -- "no" --> RULE["A scene about the top 6 keywords<br/>plus the first summary sentence"]
+    ASK --> TRUNC["truncate_words to the budget"]
+    RULE --> TRUNC
+    TRUNC --> STY["Add the style text<br/>no text, no logos, no real persons"]
+    STY --> CHK{"Inside the limit?"}
+    CHK -- "no" --> CUT2["truncate_words to the limit"]
+    CHK -- "yes" --> OUT[/"Visual prompt"/]
+    CUT2 --> OUT
+```
+
 | Generator model | Prompt limit (characters) |
 |---|---|
 | `dall-e-2` | 1,000 |
@@ -328,7 +538,7 @@ flowchart TB
 
 **Procedure**
 
-1. If an LLM is configured, ask it for one scene with a subject, a setting and a mood, inside the budget.
+1. If an LLM is configured (`VID2THUMB_SUMMARIZER=llm`), ask it for one scene with a subject, a setting and a mood, inside the budget.
 2. Else, write "A scene about" + the top 6 keywords + the first summary sentence.
 3. Cut the scene at a word boundary and add the style text: no text, no logos, no real persons.
 4. Check that the full prompt is inside the limit.
@@ -344,11 +554,45 @@ flowchart TB
 
 `cover` scales and centre-crops each image to 1280 × 720. The run record keeps the generator name, the seed and the revised prompt of the provider.
 
+```mermaid
+flowchart LR
+    P[/"Visual prompt, seed"/] --> G{"VID2THUMB_GENERATOR"}
+    G -- "placeholder" --> PH["PlaceholderGenerator<br/>SHA-256 of seed and prompt,<br/>gradient and circles"]
+    G -- "openai" --> OA["OpenAIImageGenerator<br/>images.generate, b64_json"]
+    OA --> RT{"with_retries<br/>3 attempts"}
+    RT -- "fail" --> ERR[/"ProviderError"/]
+    RT -- "pass" --> DEC["Decode base64<br/>keep revised_prompt"]
+    PH --> IMG["GeneratedImage<br/>image, prompt, meta"]
+    DEC --> IMG
+    IMG --> COV["cover<br/>scale and centre-crop to 1280 x 720"]
+    COV --> OUT[/"thumbnail_generated.png"/]
+```
+
 ---
 
 ## 10. The best-frame branch
 
 **Purpose.** Find the best REAL frame of the video.
+
+```mermaid
+flowchart TD
+    SRC[/"Source"/] --> K{"Kind"}
+    K -- "sample" --> LF["load_frames<br/>frames/*.png"]
+    K -- "video" --> EF["extract_frames with ffmpeg<br/>1 fps, 640 px"]
+    EF --> LF
+    LF --> HIST["histogram<br/>8 bins for each channel"]
+    HIST --> SB["scene_boundaries<br/>half L1 distance above 0.35"]
+    LF --> Q["quality_scores<br/>0.5 sharpness + 0.3 exposure + 0.2 colour"]
+    SB --> SK["select_keyframes<br/>best quality in each scene"]
+    Q --> SK
+    SK --> R{"VID2THUMB_RANKER"}
+    R -- "quality" --> RQ["score = quality"]
+    R -- "clip" --> RC["ClipScorer against the summary<br/>0.7 relevance + 0.3 quality"]
+    RQ --> SORT["rank_frames: sort by score"]
+    RC --> SORT
+    SORT --> SAVE[/"keyframes/*.png"/]
+    SORT --> BEST[/"thumbnail_frame.png<br/>cover to 1280 x 720"/]
+```
 
 **Procedure**
 
@@ -370,6 +614,28 @@ flowchart TB
 ---
 
 ## 11. Evaluation
+
+Each run measures each stage. A reference file adds WER, ROUGE and the scene count.
+
+```mermaid
+flowchart LR
+    RUN[/"Run outputs"/] --> PC["prompt_checks<br/>chars, within_limit, banned_terms"]
+    RUN --> REF{"reference.json?"}
+    REF -- "yes" --> W["wer against the reference transcript"]
+    REF -- "yes" --> SM1["summary_metrics<br/>support, ROUGE-1, ROUGE-2, ROUGE-L"]
+    REF -- "yes" --> SC["Scene count against scene_starts"]
+    REF -- "no" --> SM2["summary_metrics<br/>support only"]
+    RUN --> CS{"clip ranker?"}
+    CS -- "yes" --> CLIP["CLIPScore of both thumbnails"]
+    PC --> MJ[("metrics.json")]
+    W --> MJ
+    SM1 --> MJ
+    SC --> MJ
+    SM2 --> MJ
+    CLIP --> MJ
+    MJ --> EV["evaluate --manifest<br/>mean of each metric"]
+    EV --> OUT[("outputs/evaluation.json")]
+```
 
 | Stage | Metric | Needs |
 |---|---|---|
@@ -410,6 +676,21 @@ flowchart TB
 
 If the key is absent, the run stops with `error: OPENAI_API_KEY is not set`.
 
+```mermaid
+flowchart TD
+    CALL[/"Chat or image call"/] --> TRY["Call the SDK<br/>max_retries=0 in the client"]
+    TRY --> RES{"Result"}
+    RES -- "reply" --> LEN{"Chat reply cut?<br/>finish_reason length"}
+    LEN -- "no" --> OK[/"Reply text or image"/]
+    LEN -- "yes" --> EXC["ProviderError: reply cut"]
+    RES -- "exception" --> EXC2["SDK exception"]
+    EXC --> LEFT{"Attempts left?<br/>3 in total"}
+    EXC2 --> LEFT
+    LEFT -- "yes" --> WAIT["Wait 1 s, then 2 s"]
+    WAIT --> TRY
+    LEFT -- "no" --> FAIL[/"ProviderError, exit 1"/]
+```
+
 ---
 
 ## 14. How to run vid2thumb
@@ -439,7 +720,19 @@ pip install -e ".[dev]"         # add ,asr,summarize,clip,openai,download for th
 
 ### 14.3 Run vid2thumb
 
-Offline (no key, no network):
+Offline (no key, no network). The commands work together in this sequence:
+
+```mermaid
+flowchart LR
+    MS["make-sample"] --> SF[("data/sample_bread/")]
+    SF --> RUN["run"]
+    SF --> FR["frames"]
+    TXT[/"Text file"/] --> SUM["summarize"]
+    MAN[/"manifest.jsonl"/] --> EV["evaluate"]
+    RUN --> OUT[("outputs/run_id/")]
+    EV --> EJ[("outputs/evaluation.json")]
+    DEMO["demo"] -. "2 samples, run, evaluate" .-> EJ
+```
 
 ```bash
 vid2thumb demo                                         # two synthetic samples and an evaluation
@@ -555,7 +848,7 @@ Read these problems before you use vid2thumb in production.
 ## 18. Key points
 
 1. **No transcript is cut.** Map-reduce summarization uses all of the transcript inside the input budget.
-2. **All summarizers get the same task.** One instruction, one word budget, temperature 0.
+2. **All summarizers get the same task.** One word budget for each summarizer, one instruction for the LLM, temperature 0.
 3. **The image prompt fits the generator.** The visual prompt is a scene inside the prompt limit.
 4. **A real frame competes with the generated image.** Both thumbnails are saved for a comparison.
 5. **Each output is a file.** The run folder has all outputs, the metrics and the settings without the key.
